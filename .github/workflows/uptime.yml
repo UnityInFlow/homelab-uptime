@@ -1,5 +1,5 @@
 # External uptime check of the homelab's public sites (homelab-gitops #227, layer 2a, D-312/D-315).
-# Every 15 minutes on a GitHub-hosted runner: each URL in targets.txt must answer HTTP 200 within
+# Every 15 minutes (at :07, :22, :37, :52 UTC) on a GitHub-hosted runner: each URL in targets.txt must answer HTTP 200 within
 # the timeout and its TLS certificate must be valid for more than 14 days (uptime_check.py).
 # A Slack message goes to #homelab-alerts (incoming webhook in secret SLACK_WEBHOOK_URL) only
 # when a state changes; the state is kept between runs in the Actions cache. Without the secret
@@ -12,7 +12,7 @@ on:
   schedule:
     # GitHub may start a scheduled run late (often 5-20 min, most at the start of the hour) or
     # drop it under high load.
-    - cron: '*/15 * * * *'
+    - cron: '7,22,37,52 * * * *'  # every 15 min, off the hour (top-of-hour runs get delayed or dropped)
   workflow_dispatch:
     inputs:
       extra_url:

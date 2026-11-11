@@ -4,7 +4,7 @@ External uptime check for the homelab's public sites. It runs on GitHub's own ru
 reports when the whole homelab, its Internet line or its in-cluster alerting is down (layer 2a of the
 homelab alerting design, `UnityInFlow/homelab-gitops#227`).
 
-Every 15 minutes `.github/workflows/uptime.yml` runs `uptime_check.py` (Python 3, standard library
+Every 15 minutes (at :07, :22, :37, :52 UTC) `.github/workflows/uptime.yml` runs `uptime_check.py` (Python 3, standard library
 only) against each URL in [`targets.txt`](targets.txt):
 
 - HTTP `GET` must end with status **200** within the timeout (15 s). At most 3 redirects are followed,
