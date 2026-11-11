@@ -63,9 +63,10 @@ summary and logs a warning; messages stay pending until the secret exists.
 2. The next run without `extra_url` (scheduled, or **Run workflow** with the field empty) succeeds
    and Slack gets one `REMOVED hello.unityinflow.com/not-there` message.
 
-`extra_url` accepts only `http`/`https` URLs of public DNS names on the default ports (no IP
+`extra_url` accepts only `http`/`https` URLs of public ASCII DNS names on the default ports (no IP
 addresses, no `*.home.*` names, no credentials); a name that resolves to a non-public address fails
-the check without a request. A rejected value is not repeated in the log.
+the check without a request. The script reads the input from the event payload, not from the step's
+environment (which the runner prints), and does not repeat a rejected value in the log.
 
 ## Run locally
 
@@ -103,8 +104,11 @@ a Renovate update or a README change) resets the count. If the schedule was disa
 
 Only names that are internet-facing through the Cloudflare Tunnel (the routes marked "public" in
 `homelab-gitops` `docs/routes/`), never internal names, IP addresses or admin paths. `uptime_check.py`
-refuses IP addresses, numeric and internal names, names resolving to non-public addresses and
-redirects to such names; the `test` workflow checks `targets.txt` on every pull request.
+refuses IP addresses, numeric, non-ASCII and internal names, names resolving to non-public
+addresses and redirects to such names; the `test` workflow checks `targets.txt` on every pull
+request. These checks guard against mistakes, not against an attacker: only people with write access
+can change the targets or start a run, and the GitHub-hosted runner has no access to the homelab's
+networks (a name that changes its DNS answer between the check and the request is not caught).
 
 ## License
 

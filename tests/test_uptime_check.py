@@ -108,7 +108,8 @@ class TargetsTest(unittest.TestCase):
                     "ftp://example.org/", "file:///etc/passwd", "https://user:pw@example.org/",
                     "https://example.org:8443/", "https://printer.local/", "not a url", "",
                     "https://a.example.org/x\n::warning::y", "https://a.example.org/a b", "https://a.example.org/\x7f",
-                    "http://127.1/", "http://0x7f.1/"):
+                    "http://127.1/", "http://0x7f.1/", "https://home.unityinflow.com/", "https://home.arpa/",
+                    "https://logs\u3002home.unityinflow.com/", "https://b\u00fccher.example/"):
             with self.subTest(url=url):
                 with self.assertRaises(u.ConfigError) as caught:
                     u.validate_url(url)
@@ -240,9 +241,14 @@ class CertTest(unittest.TestCase):
         self.assertEqual(u.cert_result(-1, 14).problem, "certificate expired")
 
     def test_unreadable_certificate_is_unknown(self):
-        result = u.check_cert("127.0.0.1", 2, 14, now=NOW, port=closed_port())
+        result = u.check_cert("127.0.0.1", 2, 14, now=NOW, port=closed_port(), resolve=lambda h: None)
         self.assertIsNone(result.ok)
         self.assertIn("connection refused", result.problem)
+
+    def test_no_certificate_probe_to_non_public_addresses(self):
+        result = u.check_cert("localhost", 2, 14, now=NOW, port=closed_port())
+        self.assertIsNone(result.ok)
+        self.assertEqual(result.problem, "certificate not readable (name resolves to a non-public address)")
 
 
 # --------------------------------------------------------------------------- state changes
@@ -365,7 +371,8 @@ class MainTest(unittest.TestCase):
         self.cert_hosts: list[str] = []
         self.posts: list[dict] = []
         self.post_ok = True
-        env = {k: v for k, v in os.environ.items() if k not in ("SLACK_WEBHOOK_URL", "GITHUB_ACTIONS")}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SLACK_WEBHOOK_URL", "GITHUB_ACTIONS", "GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY")}
         env["SLACK_WEBHOOK_URL"] = FAKE_WEBHOOK
         patcher = unittest.mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
@@ -545,6 +552,33 @@ class MainTest(unittest.TestCase):
         self.assertTrue(self.posts[-1]["text"].startswith(f"({u.MAX_PENDING} older undelivered messages dropped)"))
         with open(self.state) as handle:
             self.assertNotIn("pending_dropped", json.load(handle))
+
+    def write_event(self, event):
+        path = os.path.join(self.dir.name, "event.json")
+        with open(path, "w") as handle:
+            json.dump(event, handle)
+        os.environ["GITHUB_EVENT_PATH"] = path
+
+    def test_extra_url_from_the_dispatch_event(self):
+        self.write_event({"inputs": {"extra_url": "https://c.example.org/x"}})
+        self.down = {"https://c.example.org/x"}
+        rc, out, _ = self.run_main("--extra-url-from-event")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  c.example.org/x", out)
+
+    def test_extra_url_from_event_without_input(self):
+        for event in ({"schedule": "*/15 * * * *"}, {"inputs": {"extra_url": ""}}, {"inputs": None}):
+            with self.subTest(event=event):
+                self.write_event(event)
+                rc, out, _ = self.run_main("--extra-url-from-event")
+                self.assertEqual(rc, 0)
+                self.assertEqual(out.count("OK  "), 2)
+
+    def test_rejected_extra_url_from_event_is_not_printed(self):
+        self.write_event({"inputs": {"extra_url": "https://vault.home.unityinflow.com/"}})
+        rc, out, err = self.run_main("--extra-url-from-event")
+        self.assertEqual(rc, 2)
+        self.assertNotIn("vault", out + err)
 
     def test_keepalive_reminder_sent_once(self):
         head_time = str(int(NOW - 52 * 86400))

@@ -41,7 +41,9 @@ jobs:
       # The state cache is per branch (a branch can read the default branch's caches, not the
       # other way round). Only runs on the default branch notify Slack and save the state; a manual
       # run on another branch only checks and reports in its log and summary.
-      ON_DEFAULT_BRANCH: ${{ github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch }}
+      ON_DEFAULT_BRANCH: >-
+        ${{ github.event_name == 'schedule'
+        || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -60,10 +62,12 @@ jobs:
         id: check
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          EXTRA_URL: ${{ inputs.extra_url }}
+        # extra_url is read by the script from the event payload ($GITHUB_EVENT_PATH), not passed
+        # through env or the command line: the runner logs a step's env, and a rejected value
+        # must not appear in this public repository's logs.
         run: |
           set -euo pipefail
-          args=(--targets targets.txt --state state/state.json --extra-url "${EXTRA_URL:-}")
+          args=(--targets targets.txt --state state/state.json --extra-url-from-event)
           if [ "$ON_DEFAULT_BRANCH" = "true" ]; then
             args+=(--head-sha "$(git rev-parse HEAD)" --head-time "$(git log -1 --format=%ct)")
           else

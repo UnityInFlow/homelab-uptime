@@ -76,6 +76,9 @@ def validate_url(url: str) -> str:
     host = (parts.hostname or "").rstrip(".").lower()
     if not host:
         raise ConfigError("URL without a host name")
+    if not host.isascii():
+        # Unicode names (and Unicode dots such as U+3002) would bypass the name checks below.
+        raise ConfigError("use the ASCII (punycode) form of the host name")
     try:
         ipaddress.ip_address(host)
     except ValueError:
@@ -84,7 +87,8 @@ def validate_url(url: str) -> str:
         raise ConfigError("IP addresses are not allowed, use a public DNS name")
     if host.rsplit(".", 1)[-1].isdigit() or host.startswith("0x"):
         raise ConfigError("numeric host names are not allowed, use a public DNS name")
-    if "." not in host or host == "localhost" or host.endswith(INTERNAL_SUFFIXES):
+    if ("." not in host or host == "localhost" or host.endswith(INTERNAL_SUFFIXES)
+            or host in {suffix.lstrip(".") for suffix in INTERNAL_SUFFIXES}):
         raise ConfigError("internal or single-label host names are not allowed")
     if port is not None and port not in (80, 443):
         raise ConfigError("only the default ports 80 and 443 are allowed")
@@ -263,7 +267,10 @@ def days_until(not_after: str, now: float) -> int:
 
 
 def check_cert(host: str, timeout: float, min_days: int, now: Optional[float] = None,
-               port: int = 443) -> CertResult:
+               port: int = 443, resolve: Callable[[str], Optional[str]] = resolution_problem) -> CertResult:
+    problem = resolve(host)
+    if problem is not None:
+        return CertResult(ok=None, days=None, problem=f"certificate not readable ({problem})")
     context = ssl.create_default_context()
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -524,11 +531,28 @@ def run_url_from_env() -> Optional[str]:
     return None
 
 
+def extra_url_from_event(path: str) -> str:
+    """The workflow_dispatch input extra_url, or "" (other events, no input, no event file)."""
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            event = json.load(handle)
+    except (OSError, ValueError):
+        raise ConfigError("cannot read the workflow event file") from None
+    inputs = event.get("inputs") if isinstance(event, dict) else None
+    value = inputs.get("extra_url", "") if isinstance(inputs, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
 def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--targets", default="targets.txt", help="file with one URL per line")
     parser.add_argument("--state", default="state/state.json", help="state file (read and rewritten)")
     parser.add_argument("--extra-url", default="", help="one more URL for this run only (testing)")
+    parser.add_argument("--extra-url-from-event", action="store_true",
+                        help="read the extra URL from the workflow_dispatch input extra_url in $GITHUB_EVENT_PATH "
+                             "(keeps a rejected value out of the step's logged environment)")
     parser.add_argument("--timeout", type=float, default=15.0, help="seconds per request (default 15)")
     parser.add_argument("--cert-min-days", type=int, default=14, help="fail at or below this many days (default 14)")
     parser.add_argument("--head-sha", default="", help="commit of the default branch (keepalive reminder)")
@@ -547,8 +571,11 @@ def main(argv: Optional[list[str]] = None,
     now = time.time() if now is None else now
     try:
         targets = load_targets(args.targets)
-        if args.extra_url.strip():
-            extra = validate_url(args.extra_url)
+        extra_url = args.extra_url
+        if args.extra_url_from_event:
+            extra_url = extra_url_from_event(os.environ.get("GITHUB_EVENT_PATH", ""))
+        if extra_url.strip():
+            extra = validate_url(extra_url)
             if extra not in targets:
                 targets.append(extra)
     except ConfigError as exc:
