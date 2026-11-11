@@ -11,8 +11,8 @@ Prints one line per target, writes a Markdown job summary when $GITHUB_STEP_SUMM
 Slack: the webhook URL is read only from the environment variable SLACK_WEBHOOK_URL and is never
 printed. One message is sent per run, and only when a state changes (up -> down, down -> up,
 certificate ok -> expiring and back, a failing target removed from the list) or the keepalive
-reminder is due. Without a previous state file only failures are sent. If the message cannot be
-delivered, the changed states are not stored, so the next run tries again.
+reminder is due. Without a previous state file only failures are sent. Messages that cannot be
+delivered (Slack error, secret missing) are kept in the state and sent with the next message.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ MAX_REDIRECTS = 3
 MAX_BODY_BYTES = 1024 * 1024
 RETRY_DELAY_SECONDS = 5.0
 STATE_VERSION = 1
+MAX_PENDING = 20  # undelivered messages kept for the next run (oldest dropped first)
 SLACK_PREFIX = "https://hooks.slack.com/"
 # GitHub disables scheduled workflows of a public repository after 60 days without repository
 # activity. Reminders go out once the last commit on the default branch is this many days old.
@@ -55,31 +56,53 @@ class ConfigError(Exception):
 
 
 def validate_url(url: str) -> str:
-    """Return the URL if it is an absolute http(s) URL of a public DNS name, else raise ConfigError."""
+    """Return the normalized URL if it is an absolute http(s) URL of a public DNS name.
+
+    Raises ConfigError otherwise. The error text never repeats the URL: a rejected value may be
+    an internal name, and the logs of this repository are public.
+    """
     url = url.strip()
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in url):
+        raise ConfigError("spaces and control characters are not allowed in URLs")
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port
-    except ValueError as exc:
-        raise ConfigError(f"not a valid URL: {url!r}") from exc
+    except ValueError:
+        raise ConfigError("not a valid URL") from None
     if parts.scheme not in ("http", "https"):
-        raise ConfigError(f"only http and https URLs are allowed: {url!r}")
+        raise ConfigError("only http and https URLs are allowed")
     if parts.username is not None or parts.password is not None:
-        raise ConfigError(f"credentials in URLs are not allowed: {url!r}")
+        raise ConfigError("credentials in URLs are not allowed")
     host = (parts.hostname or "").rstrip(".").lower()
     if not host:
-        raise ConfigError(f"URL without a host name: {url!r}")
+        raise ConfigError("URL without a host name")
     try:
         ipaddress.ip_address(host)
     except ValueError:
         pass
     else:
-        raise ConfigError(f"IP addresses are not allowed, use a public DNS name: {url!r}")
+        raise ConfigError("IP addresses are not allowed, use a public DNS name")
+    if host.rsplit(".", 1)[-1].isdigit() or host.startswith("0x"):
+        raise ConfigError("numeric host names are not allowed, use a public DNS name")
     if "." not in host or host == "localhost" or host.endswith(INTERNAL_SUFFIXES):
-        raise ConfigError(f"internal or single-label host names are not allowed: {url!r}")
+        raise ConfigError("internal or single-label host names are not allowed")
     if port is not None and port not in (80, 443):
-        raise ConfigError(f"only the default ports 80 and 443 are allowed: {url!r}")
-    return url
+        raise ConfigError("only the default ports 80 and 443 are allowed")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc.lower(), parts.path or "/", parts.query, ""))
+
+
+def resolution_problem(host: str) -> Optional[str]:
+    """None if every address of the name is a global (public) address, else a short problem."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except Exception as exc:  # noqa: BLE001
+        return classify_error(exc)
+    addresses = {info[4][0].split("%", 1)[0] for info in infos}
+    if not addresses:
+        return "DNS lookup failed"
+    if any(not ipaddress.ip_address(address).is_global for address in addresses):
+        return "name resolves to a non-public address"
+    return None
 
 
 def load_targets(path: str) -> list[str]:
@@ -93,11 +116,11 @@ def load_targets(path: str) -> list[str]:
             try:
                 url = validate_url(line)
             except ConfigError as exc:
-                raise ConfigError(f"{path}:{number}: {exc}") from None
+                raise ConfigError(f"{os.path.basename(path)} line {number}: {exc}") from None
             if url not in targets:
                 targets.append(url)
     if not targets:
-        raise ConfigError(f"{path}: no targets")
+        raise ConfigError(f"{os.path.basename(path)}: no targets")
     return targets
 
 
@@ -111,6 +134,10 @@ def label(url: str) -> str:
 
 def host_of(url: str) -> str:
     return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+
+def is_https(url: str) -> bool:
+    return urllib.parse.urlsplit(url).scheme == "https"
 
 
 # --------------------------------------------------------------------------- checks
@@ -154,28 +181,43 @@ def classify_error(exc: BaseException) -> str:
     return "connection error"
 
 
+class PolicyError(Exception):
+    """A redirect leads to a URL that is not allowed (message is public)."""
+
+
 class _LimitedRedirects(urllib.request.HTTPRedirectHandler):
     max_redirections = MAX_REDIRECTS
 
+    def __init__(self, public_only: bool = True):
+        super().__init__()
+        self.public_only = public_only
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401 (stdlib API)
-        scheme = urllib.parse.urlsplit(newurl).scheme
-        if scheme not in ("http", "https"):
-            return None
+        newurl = urllib.parse.urljoin(req.full_url, newurl)
+        if urllib.parse.urlsplit(newurl).scheme not in ("http", "https"):
+            raise PolicyError("redirect to a non-http URL")
+        if self.public_only:
+            try:
+                validate_url(newurl)
+            except ConfigError:
+                raise PolicyError("redirect to a non-public URL") from None
+            if resolution_problem(host_of(newurl)) is not None:
+                raise PolicyError("redirect to a non-public URL")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener() -> urllib.request.OpenerDirector:
+def _opener(public_only: bool = True) -> urllib.request.OpenerDirector:
     context = ssl.create_default_context()
-    return urllib.request.build_opener(_LimitedRedirects(), urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(_LimitedRedirects(public_only), urllib.request.HTTPSHandler(context=context))
 
 
-def check_http_once(url: str, timeout: float) -> HttpResult:
+def check_http_once(url: str, timeout: float, public_only: bool = True) -> HttpResult:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}, method="GET")
     start = time.monotonic()
     status: Optional[int] = None
     problem: Optional[str] = None
     try:
-        with _opener().open(request, timeout=timeout) as response:
+        with _opener(public_only).open(request, timeout=timeout) as response:
             status = response.status
             remaining = MAX_BODY_BYTES
             while remaining > 0 and time.monotonic() - start <= timeout:
@@ -186,6 +228,8 @@ def check_http_once(url: str, timeout: float) -> HttpResult:
     except urllib.error.HTTPError as exc:
         status = exc.code
         exc.close()
+    except PolicyError as exc:
+        problem = str(exc)
     except Exception as exc:  # noqa: BLE001 - any network failure is a "down" result
         problem = classify_error(exc)
     elapsed = time.monotonic() - start
@@ -198,8 +242,13 @@ def check_http_once(url: str, timeout: float) -> HttpResult:
 
 def check_http(url: str, timeout: float, retry_delay: float = RETRY_DELAY_SECONDS,
                once: Callable[[str, float], HttpResult] = check_http_once,
-               sleep: Callable[[float], None] = time.sleep) -> HttpResult:
-    """One retry after a short pause, so a single dropped request does not page anyone."""
+               sleep: Callable[[float], None] = time.sleep,
+               resolve: Callable[[str], Optional[str]] = resolution_problem) -> HttpResult:
+    """Refuse names with non-public addresses; one retry after a short pause, so a single
+    dropped request does not page anyone."""
+    problem = resolve(host_of(url))
+    if problem == "name resolves to a non-public address":
+        return HttpResult(ok=False, status=None, problem=problem, elapsed=0.0)
     result = once(url, timeout)
     if result.ok:
         return result
@@ -252,6 +301,15 @@ def load_state(path: str) -> Optional[dict]:
         print("warning: previous state has an unknown format, treating this run as the first", file=sys.stderr)
         return None
     return data
+
+
+def load_pending(previous: Optional[dict]) -> list[dict]:
+    """Undelivered messages of earlier runs (malformed entries are ignored)."""
+    entries = (previous or {}).get("pending")
+    if not isinstance(entries, list):
+        return []
+    return [{"time": str(entry["time"]), "text": str(entry["text"])} for entry in entries
+            if isinstance(entry, dict) and "time" in entry and "text" in entry]
 
 
 def save_state(path: str, state: dict) -> None:
@@ -390,7 +448,7 @@ class TargetReport:
 
     @property
     def ok(self) -> bool:
-        return self.http.ok and (self.cert is None or self.cert.ok is not False)
+        return self.http.ok and (self.cert is None or self.cert.ok is True)
 
     def detail(self) -> str:
         if self.http.ok:
@@ -411,19 +469,29 @@ class TargetReport:
 def run_checks(targets: list[str], timeout: float, min_days: int, now: float,
                http_fn: Callable[[str, float], HttpResult] = check_http,
                cert_fn: Callable[..., CertResult] = check_cert) -> list[TargetReport]:
-    https_hosts = sorted({host_of(url) for url in targets if url.startswith("https://")})
+    https_hosts = sorted({host_of(url) for url in targets if is_https(url)})
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         http_futures = {url: pool.submit(http_fn, url, timeout) for url in targets}
         cert_futures = {host: pool.submit(cert_fn, host, timeout, min_days, now) for host in https_hosts}
         certs = {host: future.result() for host, future in cert_futures.items()}
         return [TargetReport(url=url, http=http_futures[url].result(),
-                             cert=certs.get(host_of(url)) if url.startswith("https://") else None)
+                             cert=certs.get(host_of(url)) if is_https(url) else None)
                 for url in targets]
 
 
 def to_checks(reports: list[TargetReport]) -> list[Check]:
+    """One check per URL and one certificate check per https host.
+
+    A certificate that could not be read counts as failed if any URL of that host answered (the
+    lifetime is then unknown although the site is up); if every URL of the host failed, the HTTP
+    checks already report it and the certificate state stays unchanged.
+    """
     checks: list[Check] = []
     seen_hosts: set[str] = set()
+    host_answers: dict[str, bool] = {}
+    for report in reports:
+        host = host_of(report.url)
+        host_answers[host] = host_answers.get(host, False) or report.http.ok
     for report in reports:
         http = report.http
         checks.append(Check(key=f"http {report.url}", name=label(report.url), ok=http.ok,
@@ -433,7 +501,8 @@ def to_checks(reports: list[TargetReport]) -> list[Check]:
             seen_hosts.add(host)
             cert = report.cert
             detail = cert.problem if cert.ok is not True else f"{cert.days} days left"
-            checks.append(Check(key=f"cert {host}", name=host, ok=cert.ok, detail=detail or ""))
+            ok = cert.ok if cert.ok is not None or not host_answers[host] else False
+            checks.append(Check(key=f"cert {host}", name=host, ok=ok, detail=detail or ""))
     return checks
 
 
@@ -482,8 +551,11 @@ def main(argv: Optional[list[str]] = None,
             extra = validate_url(args.extra_url)
             if extra not in targets:
                 targets.append(extra)
-    except (ConfigError, OSError) as exc:
+    except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: cannot read the targets file ({exc.strerror})", file=sys.stderr)
         return 2
 
     previous = load_state(args.state)
@@ -504,42 +576,53 @@ def main(argv: Optional[list[str]] = None,
         annotate_warning(f"last commit on the default branch is {age} days old; GitHub disables the schedule at {DISABLE_AFTER_DAYS} days")
         notes.append(f"Keepalive: last commit is {age} days old (schedule disabled after {DISABLE_AFTER_DAYS} days without activity).")
 
-    delivered = True
-    webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     if lines:
         print(f"{len(lines)} state change(s) to report:")
         for line in lines:
             print(f"  {line}")
-        if args.no_notify:
-            notes.append("Slack: not sent (--no-notify).")
-        elif not webhook:
-            annotate_warning("SLACK_WEBHOOK_URL is not set: state changes are reported only in this log, the job summary and the exit code")
-            notes.append("Slack: not sent, secret SLACK_WEBHOOK_URL is not set.")
-        elif not webhook.startswith(SLACK_PREFIX):
-            annotate_warning("SLACK_WEBHOOK_URL does not look like a Slack incoming webhook; nothing sent")
-            notes.append("Slack: not sent, the webhook secret has an unexpected format.")
-            delivered = False
-        else:
-            delivered = post_fn(webhook, build_message(lines, run_url_from_env()))
-            notes.append("Slack: sent." if delivered else "Slack: delivery failed; the changes are reported again next run.")
-            if not delivered:
-                annotate_warning("Slack delivery failed; the changes are kept pending for the next run")
     else:
         print("no state changes")
 
-    if not delivered:
-        # Keep the old value of every changed check (a check without an old value stays absent)
-        # and the old keepalive level, so the next run sees the same changes again.
-        old_checks = (previous or {}).get("checks", {})
-        for key, _ in events:
-            if key in old_checks:
-                new_checks[key] = old_checks[key]
-            else:
-                new_checks.pop(key, None)
-        keepalive = (previous or {}).get("keepalive")
-    state = {"version": STATE_VERSION, "checks": new_checks}
+    # Messages that could not be delivered earlier are sent first, marked with the time they were
+    # detected; anything not delivered now stays pending in the state for the next run.
+    detected = dt.datetime.fromtimestamp(now, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    earlier = load_pending(previous)
+    queue = earlier + [{"time": detected, "text": line} for line in lines]
+    dropped_now = max(0, len(queue) - MAX_PENDING)
+    queue = queue[dropped_now:]
+    kept_earlier = max(0, len(earlier) - dropped_now)
+    dropped = dropped_now + int((previous or {}).get("pending_dropped", 0) or 0)
+    pending: list[dict] = []
+    if queue:
+        outgoing = [f"{entry['text']} (detected {entry['time']})" if index < kept_earlier else entry["text"]
+                    for index, entry in enumerate(queue)]
+        if dropped:
+            outgoing.insert(0, f"({dropped} older undelivered messages dropped)")
+        webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+        if args.no_notify:
+            notes.append("Slack: not sent (--no-notify).")
+        elif not webhook:
+            pending = queue
+            annotate_warning("SLACK_WEBHOOK_URL is not set: changes are reported only in this log, the job summary and the exit code, and kept pending")
+            notes.append(f"Slack: not sent, secret SLACK_WEBHOOK_URL is not set ({len(queue)} message(s) pending).")
+        elif not webhook.startswith(SLACK_PREFIX):
+            pending = queue
+            annotate_warning("SLACK_WEBHOOK_URL does not look like a Slack incoming webhook; nothing sent")
+            notes.append(f"Slack: not sent, the webhook secret has an unexpected format ({len(queue)} message(s) pending).")
+        elif post_fn(webhook, build_message(outgoing, run_url_from_env())):
+            notes.append(f"Slack: sent {len(outgoing)} line(s).")
+        else:
+            pending = queue
+            annotate_warning("Slack delivery failed; the messages are kept pending for the next run")
+            notes.append(f"Slack: delivery failed ({len(queue)} message(s) pending for the next run).")
+
+    state: dict = {"version": STATE_VERSION, "checks": new_checks}
     if keepalive:
         state["keepalive"] = keepalive
+    if pending:
+        state["pending"] = pending
+        if dropped:
+            state["pending_dropped"] = dropped
     save_state(args.state, state)
 
     if args.summary:

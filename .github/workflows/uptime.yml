@@ -37,6 +37,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    env:
+      # The state cache is per branch (a branch can read the default branch's caches, not the
+      # other way round). Only runs on the default branch notify Slack and save the state; a manual
+      # run on another branch only checks and reports in its log and summary.
+      ON_DEFAULT_BRANCH: ${{ github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -56,18 +61,19 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           EXTRA_URL: ${{ inputs.extra_url }}
-          ON_DEFAULT_BRANCH: ${{ github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           args=(--targets targets.txt --state state/state.json --extra-url "${EXTRA_URL:-}")
           if [ "$ON_DEFAULT_BRANCH" = "true" ]; then
             args+=(--head-sha "$(git rev-parse HEAD)" --head-time "$(git log -1 --format=%ct)")
+          else
+            args+=(--no-notify)
           fi
           python3 uptime_check.py "${args[@]}"
 
       - name: Save state
         # Also after a failed check: the state of a down target must reach the next run.
-        if: always() && hashFiles('state/state.json') != ''
+        if: always() && env.ON_DEFAULT_BRANCH == 'true' && hashFiles('state/state.json') != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: state

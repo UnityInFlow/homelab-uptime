@@ -44,6 +44,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Location", f"/hop{hops - 1}")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+        elif self.path == "/to-internal":
+            self.send_response(302)
+            self.send_header("Location", "https://logs.home.unityinflow.com/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/to-ftp":
+            self.send_response(302)
+            self.send_header("Location", "ftp://example.org/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path == "/slow":
             time.sleep(1.5)
             self._reply(200, b"late")
@@ -85,16 +95,26 @@ def closed_port() -> int:
 class TargetsTest(unittest.TestCase):
     def test_public_urls_are_accepted(self):
         for url in ("https://jirihermann.com/", "https://keycloak.kotlinserversquad.com/realms/x",
-                    "http://example.org", "https://example.org:443/a"):
+                    "http://example.org/", "https://example.org:443/a"):
             self.assertEqual(u.validate_url(url), url)
+
+    def test_urls_are_normalized(self):
+        self.assertEqual(u.validate_url("HTTPS://Example.ORG"), "https://example.org/")
+        self.assertEqual(u.validate_url("https://example.org/a?b=1#frag"), "https://example.org/a?b=1")
 
     def test_internal_and_unsafe_urls_are_refused(self):
         for url in ("https://hello.home.unityinflow.com/", "https://HELLO.HOME.unityinflow.com./",
                     "https://192.168.1.10/", "https://[::1]/", "http://localhost/", "https://intranet/",
                     "ftp://example.org/", "file:///etc/passwd", "https://user:pw@example.org/",
-                    "https://example.org:8443/", "https://printer.local/", "not a url", ""):
-            with self.subTest(url=url), self.assertRaises(u.ConfigError):
-                u.validate_url(url)
+                    "https://example.org:8443/", "https://printer.local/", "not a url", "",
+                    "https://a.example.org/x\n::warning::y", "https://a.example.org/a b", "https://a.example.org/\x7f",
+                    "http://127.1/", "http://0x7f.1/"):
+            with self.subTest(url=url):
+                with self.assertRaises(u.ConfigError) as caught:
+                    u.validate_url(url)
+                if url:
+                    self.assertNotIn(url, str(caught.exception))
+                    self.assertNotIn("home.unityinflow", str(caught.exception).lower())
 
     def test_load_targets_skips_comments_and_duplicates(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
@@ -108,7 +128,7 @@ class TargetsTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
             handle.write("https://a.example.org/\nhttps://x.home.unityinflow.com/\n")
         try:
-            with self.assertRaisesRegex(u.ConfigError, r":2: "):
+            with self.assertRaisesRegex(u.ConfigError, r" line 2: internal"):
                 u.load_targets(handle.name)
         finally:
             os.unlink(handle.name)
@@ -143,11 +163,24 @@ class HttpTest(unittest.TestCase):
 
     def test_redirects_followed_up_to_the_limit(self):
         with LocalServer() as srv:
-            ok = u.check_http_once(srv.base + f"/hop{u.MAX_REDIRECTS - 1}", 5)
-            too_many = u.check_http_once(srv.base + f"/hop{u.MAX_REDIRECTS + 2}", 5)
+            ok = u.check_http_once(srv.base + f"/hop{u.MAX_REDIRECTS - 1}", 5, public_only=False)
+            too_many = u.check_http_once(srv.base + f"/hop{u.MAX_REDIRECTS + 2}", 5, public_only=False)
         self.assertTrue(ok.ok)
         self.assertFalse(too_many.ok)
         self.assertEqual(too_many.status, 301)
+
+    def test_redirect_to_internal_or_non_http_is_refused(self):
+        with LocalServer() as srv:
+            internal = u.check_http_once(srv.base + "/to-internal", 5)
+            ftp = u.check_http_once(srv.base + "/to-ftp", 5, public_only=False)
+        self.assertEqual((internal.ok, internal.problem), (False, "redirect to a non-public URL"))
+        self.assertEqual((ftp.ok, ftp.problem), (False, "redirect to a non-http URL"))
+
+    def test_name_with_non_public_address_is_refused(self):
+        self.assertEqual(u.resolution_problem("localhost"), "name resolves to a non-public address")
+        result = u.check_http("https://a.example.org/", 5, once=lambda *a: self.fail("requested"),
+                              resolve=lambda host: "name resolves to a non-public address")
+        self.assertEqual((result.ok, result.problem), (False, "name resolves to a non-public address"))
 
     def test_slow_answer_is_a_timeout(self):
         with LocalServer() as srv:
@@ -168,7 +201,7 @@ class HttpTest(unittest.TestCase):
             return u.HttpResult(ok=len(calls) > 1, status=200 if len(calls) > 1 else 502,
                                 problem=None if len(calls) > 1 else "HTTP 502", elapsed=0.1)
 
-        result = u.check_http("https://a.example.org/", 5, once=once, sleep=lambda _: None)
+        result = u.check_http("https://a.example.org/", 5, once=once, sleep=lambda _: None, resolve=lambda h: None)
         self.assertTrue(result.ok)
         self.assertEqual(len(calls), 2)
 
@@ -179,7 +212,7 @@ class HttpTest(unittest.TestCase):
             calls.append(url)
             return u.HttpResult(ok=True, status=200, problem=None, elapsed=0.1)
 
-        u.check_http("https://a.example.org/", 5, once=once, sleep=lambda _: self.fail("slept"))
+        u.check_http("https://a.example.org/", 5, once=once, sleep=lambda _: self.fail("slept"), resolve=lambda h: None)
         self.assertEqual(len(calls), 1)
 
     def test_classify_error(self):
@@ -328,6 +361,8 @@ class MainTest(unittest.TestCase):
         self.summary = os.path.join(self.dir.name, "summary.md")
         self.down: set[str] = set()
         self.cert_days = 60
+        self.cert_unreadable = False
+        self.cert_hosts: list[str] = []
         self.posts: list[dict] = []
         self.post_ok = True
         env = {k: v for k, v in os.environ.items() if k not in ("SLACK_WEBHOOK_URL", "GITHUB_ACTIONS")}
@@ -342,6 +377,9 @@ class MainTest(unittest.TestCase):
         return u.HttpResult(ok=True, status=200, problem=None, elapsed=0.1)
 
     def cert(self, host, timeout, min_days, now):
+        self.cert_hosts.append(host)
+        if self.cert_unreadable:
+            return u.CertResult(ok=None, days=None, problem="certificate not readable (timeout)")
         return u.cert_result(self.cert_days, min_days)
 
     def post(self, webhook, payload):
@@ -441,9 +479,72 @@ class MainTest(unittest.TestCase):
         self.assertIn("REMOVED a.example.org/missing", self.posts[-1]["text"])
 
     def test_internal_extra_url_is_refused(self):
-        rc, _, err = self.run_main("--extra-url", "https://logs.home.unityinflow.com/")
+        rc, out, err = self.run_main("--extra-url", "https://logs.home.unityinflow.com/")
         self.assertEqual(rc, 2)
         self.assertIn("internal", err)
+        self.assertNotIn("logs.home", out + err)
+
+    def test_unreadable_certificate_fails_when_the_site_answers(self):
+        self.run_main()
+        self.cert_unreadable = True
+        rc, _, _ = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertIn("CERT a.example.org: certificate not readable (timeout)", self.posts[-1]["text"])
+
+    def test_unreadable_certificate_of_a_down_host_is_not_a_second_message(self):
+        self.run_main()
+        self.cert_unreadable = True
+        self.down = {"https://a.example.org/"}
+        self.run_main()
+        self.assertIn("DOWN a.example.org", self.posts[-1]["text"])
+        self.assertNotIn("CERT a.example.org", self.posts[-1]["text"])
+
+    def test_uppercase_scheme_still_checks_the_certificate(self):
+        with open(self.targets, "w") as handle:
+            handle.write("HTTPS://A.Example.org/\n")
+        self.run_main()
+        self.assertEqual(self.cert_hosts, ["a.example.org"])
+
+    def test_missing_webhook_keeps_messages_pending(self):
+        del os.environ["SLACK_WEBHOOK_URL"]
+        self.run_main()
+        self.down = {"https://a.example.org/"}
+        self.run_main()
+        os.environ["SLACK_WEBHOOK_URL"] = FAKE_WEBHOOK
+        self.run_main()
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("DOWN a.example.org: HTTP 503 (detected ", self.posts[0]["text"])
+
+    def test_outage_that_ends_before_delivery_is_still_reported(self):
+        self.run_main()
+        self.down = {"https://a.example.org/"}
+        self.post_ok = False
+        self.run_main()
+        self.down = set()
+        self.post_ok = True
+        self.run_main()
+        text = self.posts[-1]["text"]
+        self.assertIn("DOWN a.example.org: HTTP 503 (detected ", text)
+        self.assertIn("RECOVERED a.example.org", text)
+        self.assertLess(text.index("DOWN"), text.index("RECOVERED"))
+        self.run_main()
+        self.assertEqual(len(self.posts), 2)
+
+    def test_pending_queue_is_capped(self):
+        del os.environ["SLACK_WEBHOOK_URL"]
+        self.run_main()
+        for _ in range(u.MAX_PENDING):
+            self.down = {"https://a.example.org/"}
+            self.run_main()
+            self.down = set()
+            self.run_main()
+        with open(self.state) as handle:
+            self.assertEqual(len(json.load(handle)["pending"]), u.MAX_PENDING)
+        os.environ["SLACK_WEBHOOK_URL"] = FAKE_WEBHOOK
+        self.run_main()
+        self.assertTrue(self.posts[-1]["text"].startswith(f"({u.MAX_PENDING} older undelivered messages dropped)"))
+        with open(self.state) as handle:
+            self.assertNotIn("pending_dropped", json.load(handle))
 
     def test_keepalive_reminder_sent_once(self):
         head_time = str(int(NOW - 52 * 86400))
