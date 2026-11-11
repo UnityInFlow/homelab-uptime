@@ -1,0 +1,5 @@
+# Local state of uptime_check.py (kept between runs in the Actions cache, never committed)
+/state/
+__pycache__/
+*.pyc
+.venv/

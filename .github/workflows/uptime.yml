@@ -1,0 +1,74 @@
+# External uptime check of the homelab's public sites (homelab-gitops #227, layer 2a, D-312/D-315).
+# Every 15 minutes on a GitHub-hosted runner: each URL in targets.txt must answer HTTP 200 within
+# the timeout and its TLS certificate must be valid for more than 14 days (uptime_check.py).
+# A Slack message goes to #homelab-alerts (incoming webhook in secret SLACK_WEBHOOK_URL) only
+# when a state changes; the state is kept between runs in the Actions cache. Without the secret
+# the run still fails on a down target and lists everything in the job summary.
+# Keepalive: GitHub disables scheduled workflows of a public repository after 60 days without
+# repository activity; from day 50 after the last commit the same run sends a reminder (README).
+name: uptime
+
+on:
+  schedule:
+    # GitHub may start a scheduled run late (often 5-20 min, most at the start of the hour) or
+    # drop it under high load.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      extra_url:
+        description: 'One more public URL for this run only, e.g. a path that answers 404 to test a "down" message'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time, so each run reads the state the previous one saved. A queued run is
+  # replaced by a newer one; a running check is never cancelled.
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check public targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore previous state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: state
+          # Never an exact hit (run-unique key): the newest entry with the prefix is restored.
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            uptime-state-
+
+      - name: Check targets
+        id: check
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EXTRA_URL: ${{ inputs.extra_url }}
+          ON_DEFAULT_BRANCH: ${{ github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          args=(--targets targets.txt --state state/state.json --extra-url "${EXTRA_URL:-}")
+          if [ "$ON_DEFAULT_BRANCH" = "true" ]; then
+            args+=(--head-sha "$(git rev-parse HEAD)" --head-time "$(git log -1 --format=%ct)")
+          fi
+          python3 uptime_check.py "${args[@]}"
+
+      - name: Save state
+        # Also after a failed check: the state of a down target must reach the next run.
+        if: always() && hashFiles('state/state.json') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}

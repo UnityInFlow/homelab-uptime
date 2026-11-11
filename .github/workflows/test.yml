@@ -1,0 +1,30 @@
+# Unit tests of uptime_check.py and a format check of targets.txt (no network, no secrets).
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit tests and targets format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: targets.txt holds only public http(s) names
+        run: python3 -c 'import uptime_check as u; print(len(u.load_targets("targets.txt")), "targets")'

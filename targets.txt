@@ -1,0 +1,20 @@
+# Public URLs of the homelab, checked every 15 minutes from GitHub-hosted runners.
+# One URL per line; blank lines and lines starting with '#' are ignored.
+# Only names that are internet-facing through the Cloudflare Tunnel (homelab-gitops docs/routes,
+# entries marked "public"). Never internal names (*.home.*), IP addresses or admin paths;
+# uptime_check.py refuses internal names and IP addresses.
+
+# Public sample page: proves DNS, Cloudflare edge, tunnel, Traefik and a pod end to end.
+https://hello.unityinflow.com/
+
+# Personal website: frontend and backend API (route record health checks).
+https://jirihermann.com/
+https://jirihermann.com/api/version
+
+# Kotlin Server Squad: frontend and backend API (route record health checks).
+https://kotlinserversquad.com/
+https://kotlinserversquad.com/api/articles
+
+# Keycloak, public name: only the app realms are reachable from the Internet (edge filter);
+# the route record's health check is this discovery document.
+https://keycloak.kotlinserversquad.com/realms/personalblog/.well-known/openid-configuration
